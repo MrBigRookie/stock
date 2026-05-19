@@ -318,6 +318,84 @@ def fetch_stock_fund_flow(code, name):
     }
 
 
+def fetch_xueqiu_hot():
+    """雪球社区热门股票（讨论热度和关注度），过滤新能源/AI相关"""
+    df = _safe_call(ak.stock_hot_tweet_xq, "雪球热帖", retries=2, symbol="最热门")
+    if df is None or df.empty:
+        return [], []
+
+    # 所有目标股票名称集合
+    target_names = set()
+    for kws in KEYWORDS.values():
+        for kw in kws:
+            if len(kw) >= 3:
+                target_names.add(kw)
+
+    hot_relevant = []
+    for _, row in df.iterrows():
+        name = str(row.get("股票简称", ""))
+        code = str(row.get("股票代码", ""))
+        hot_count = row.get("关注", 0)
+        if pd.isna(hot_count):
+            hot_count = 0
+        hot_count = int(hot_count)
+
+        # 匹配目标公司
+        matched = any(kw in name for kw in target_names)
+        if matched:
+            hot_relevant.append({
+                "code": code,
+                "name": name,
+                "hot_count": hot_count,
+            })
+
+    # 按热度排序
+    hot_relevant.sort(key=lambda x: x["hot_count"], reverse=True)
+
+    # Top 10 雪球热门（不限行业）
+    top10 = []
+    for _, row in df.head(10).iterrows():
+        top10.append({
+            "name": str(row.get("股票简称", "")),
+            "hot": int(row.get("关注", 0)) if pd.notna(row.get("关注")) else 0,
+        })
+
+    return hot_relevant[:15], top10
+
+
+def fetch_caixin_news():
+    """财新网精选新闻，过滤新能源/AI关键词，带原文链接"""
+    df = _safe_call(ak.stock_news_main_cx, "财新网新闻")
+    if df is None or df.empty:
+        return []
+
+    relevant = []
+    for _, row in df.iterrows():
+        tag = str(row.get("tag", ""))
+        summary = str(row.get("summary", ""))
+        url = str(row.get("url", ""))
+        text = tag + " " + summary
+
+        # 关键词匹配
+        matched_kws = []
+        for sector, kws in KEYWORDS.items():
+            hits = match_keywords(text, kws)
+            if hits:
+                matched_kws.extend(hits)
+
+        if matched_kws:
+            # 截取摘要
+            short = summary[:120] + "..." if len(summary) > 120 else summary
+            relevant.append({
+                "tag": tag,
+                "summary": short,
+                "url": url,
+                "keywords": list(set(matched_kws))[:5],
+            })
+
+    return relevant[:10]
+
+
 # ── 分析引擎 ──────────────────────────────────────────
 
 def extract_companies(text):
@@ -382,7 +460,7 @@ def analyze_news(news_list):
 # ── 输出 ──────────────────────────────────────────────
 
 def print_report(scored, keyword_hits, north_summary, north_detail, market_flow,
-                 zt_relevant, zt_stats, lhb_relevant, top_n):
+                 zt_relevant, zt_stats, lhb_relevant, xq_relevant, xq_top10, cx_news, top_n):
     """终端报告"""
     print("\n" + "=" * 80)
     print(f"  财经资讯分析报告  |  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -399,6 +477,18 @@ def print_report(scored, keyword_hits, north_summary, north_detail, market_flow,
         if market_flow.get("super_large"):
             extra = f" (超大单{market_flow['super_large']/1e8:+.1f}亿)"
         print(f"  [主力] {s}{extra}")
+
+    # 雪球社区
+    if xq_top10:
+        print(f"\n  ━━ 雪球社区热门股 TOP10 ━━")
+        for i, item in enumerate(xq_top10, 1):
+            hot_str = f"{item['hot']/1e4:.1f}万" if item['hot'] >= 10000 else str(item['hot'])
+            print(f"  {i}. {item['name']:<10} 热度: {hot_str}")
+    if xq_relevant:
+        print(f"\n  ━━ 雪球AI/新能源热门 ━━")
+        for item in xq_relevant[:6]:
+            hot_str = f"{item['hot_count']/1e4:.1f}万" if item['hot_count'] >= 10000 else str(item['hot_count'])
+            print(f"  {item['name']:<10} {item['code']:<10} 热度: {hot_str}")
 
     # 涨停板
     if zt_stats and zt_stats["total"] > 0:
@@ -418,6 +508,15 @@ def print_report(scored, keyword_hits, north_summary, north_detail, market_flow,
         for i, item in enumerate(lhb_relevant[:8], 1):
             net_str = f"{item['net_buy']/1e8:+.2f}亿" if abs(item['net_buy']) >= 1e8 else f"{item['net_buy']/1e4:+.0f}万"
             print(f"  {i}. {item['name']:<8} {net_str:<12} {item['jiedu'][:40]}")
+
+    # 财新网
+    if cx_news:
+        print(f"\n  ━━ 财新网相关文章 ━━")
+        for i, item in enumerate(cx_news[:6], 1):
+            kws = ",".join(item["keywords"][:3])
+            print(f"  {i}. [{item['tag']}] {item['summary'][:100]}")
+            print(f"     🔗 {item['url']}")
+            print(f"     🏷️ {kws}")
 
     # 新闻分析排名
     if not scored:
@@ -477,18 +576,24 @@ def export_csv(scored, zt_relevant, lhb_relevant, keyword_hits):
 # ── 推送 ──────────────────────────────────────────────
 
 def push_bark(title, body):
-    """Bark 推送"""
+    """Bark 推送（POST 方式避免 URL 过长）"""
     key = CONFIG["bark_key"]
     if not key:
         print("  [INFO] 未配置 BARK_KEY，跳过推送")
         return False
-    url = f"{CONFIG['bark_url']}/{key}/{quote(title)}/{quote(body)}"
+    url = f"{CONFIG['bark_url']}/push"
+    data = {
+        "device_key": key,
+        "title": title,
+        "body": body,
+    }
     try:
-        resp = requests.get(url, timeout=10)
-        if resp.json().get("code") == 200:
+        resp = requests.post(url, json=data, timeout=15)
+        result = resp.json()
+        if result.get("code") == 200:
             print(f"  推送成功: {title}")
             return True
-        print(f"  [WARN] 推送失败: {resp.json()}")
+        print(f"  [WARN] 推送失败: {result}")
         return False
     except Exception as e:
         print(f"  [WARN] 推送异常: {e}")
@@ -496,52 +601,60 @@ def push_bark(title, body):
 
 
 def build_push_message(scored, north_summary, north_detail, market_flow,
-                       zt_relevant, zt_stats, lhb_relevant, keyword_hits):
-    """构建结构化推送"""
+                       zt_relevant, zt_stats, lhb_relevant, xq_relevant, xq_top10,
+                       cx_news, keyword_hits):
+    """构建推送消息（精简版，适合手机屏幕）"""
     now = datetime.now().strftime("%m-%d %H:%M")
-    lines = [f"【财经日报 {now}】", ""]
+    lines = [f"财经日报 {now}", ""]
 
     # 资金面
-    lines.append("━━ 资金面 ━━")
-    lines.append(north_summary)
+    lines.append(f"资金: {north_summary}")
     if market_flow:
         lines.append(market_flow["summary"])
     lines.append("")
 
+    # 雪球热门（精简）
+    if xq_relevant:
+        names = [item["name"] for item in xq_relevant[:3]]
+        lines.append(f"雪球热门: {', '.join(names)}")
+        lines.append("")
+
     # 涨停
-    if zt_stats and zt_stats["total"] > 0:
-        rel = zt_stats["relevant"]
-        lines.append(f"━━ 涨停({zt_stats['total']}家) ━━")
-        lines.append(f"新能源/AI相关: {rel}家")
-        if zt_relevant:
-            for item in zt_relevant[:6]:
-                lb = f"{item['limit_times']}连板" if item["limit_times"] > 1 else ""
-                lines.append(f"  {item['name']} {lb} [{item['keyword']}]")
+    if zt_stats and zt_stats["total"] > 0 and zt_relevant:
+        names = [item["name"] for item in zt_relevant[:4]]
+        lines.append(f"涨停({zt_stats['relevant']}/{zt_stats['total']}): {', '.join(names)}")
         lines.append("")
 
-    # 龙虎榜
+    # 龙虎榜（精简）
     if lhb_relevant:
-        lines.append("━━ 龙虎榜 ━━")
-        for item in lhb_relevant[:5]:
-            net_str = f"{item['net_buy']/1e8:+.2f}亿" if abs(item['net_buy']) >= 1e8 else f"{item['net_buy']/1e4:+.0f}万"
-            lines.append(f"  {item['name']} {net_str} {item['jiedu'][:30]}")
+        nets = []
+        for item in lhb_relevant[:3]:
+            net = f"{item['net_buy']/1e8:.1f}亿" if abs(item['net_buy']) >= 1e8 else f"{item['net_buy']/1e4:.0f}万"
+            nets.append(f"{item['name']}+{net}")
+        lines.append(f"龙虎榜: {', '.join(nets)}")
         lines.append("")
 
-    # 热度排行
+    # 热度
     if scored:
-        lines.append("━━ 热度排行 ━━")
-        for i, item in enumerate(scored[:8], 1):
-            sent = "↑" if item["sentiment"] > 0 else ("↓" if item["sentiment"] < 0 else "→")
-            lines.append(f"{i}.{item['name']} {sent}({item['score']})")
+        top_names = [f"{item['name']}({item['score']})" for item in scored[:5]]
+        lines.append(f"热度: {', '.join(top_names)}")
         lines.append("")
 
-    # 热门词
+    # 财新链接（最多2条）
+    if cx_news:
+        lines.append("财新:")
+        for item in cx_news[:2]:
+            lines.append(f"  {item['summary'][:60]}")
+            lines.append(f"  {item['url']}")
+        lines.append("")
+
+    # 关键词
     if keyword_hits:
-        top_kw = [f"{kw}({cnt})" for kw, cnt in keyword_hits.most_common(6)]
-        lines.append("🏷️ " + " ".join(top_kw))
+        top_kw = " ".join([f"{kw}({cnt})" for kw, cnt in keyword_hits.most_common(5)])
+        lines.append(top_kw)
 
     body = "\n".join(lines)
-    return body[:480] + "..." if len(body) > 500 else body
+    return body[:800] + "..." if len(body) > 820 else body
 
 
 # ── 主流程 ──────────────────────────────────────────────
@@ -585,22 +698,39 @@ def run_analysis():
     else:
         print(f"     (无相关记录)")
 
-    # 6. 新闻分析
-    print("  -> 分析新闻...")
+    # 6. 雪球社区
+    print("  -> 获取雪球社区热度...")
+    xq_relevant, xq_top10 = fetch_xueqiu_hot()
+    if xq_relevant:
+        print(f"     AI/新能源相关 {len(xq_relevant)} 只热门股")
+    else:
+        print(f"     (无相关数据)")
+
+    # 7. 财新网
+    print("  -> 获取财新网精选新闻...")
+    cx_news = fetch_caixin_news()
+    if cx_news:
+        print(f"     相关文章 {len(cx_news)} 篇")
+    else:
+        print(f"     (无相关文章)")
+
+    # 8. 新闻分析
+    print("  -> 分析快讯...")
     scored, keyword_hits = analyze_news(all_news)
 
-    # 7. 输出
+    # 9. 输出
     print_report(scored, keyword_hits, north_flow["summary"], north_detail, market_flow,
-                 zt_relevant, zt_stats, lhb_relevant, CONFIG["top_n"])
+                 zt_relevant, zt_stats, lhb_relevant, xq_relevant, xq_top10, cx_news, CONFIG["top_n"])
 
-    # 8. 导出
+    # 10. 导出
     export_csv(scored, zt_relevant, lhb_relevant, keyword_hits)
 
-    # 9. 推送
+    # 11. 推送
     if CONFIG["bark_key"]:
         title = f"财经日报 {datetime.now().strftime('%m-%d')}"
         body = build_push_message(scored, north_flow["summary"], north_detail, market_flow,
-                                  zt_relevant, zt_stats, lhb_relevant, keyword_hits)
+                                  zt_relevant, zt_stats, lhb_relevant, xq_relevant, xq_top10,
+                                  cx_news, keyword_hits)
         push_bark(title, body)
 
     elapsed = time.time() - t0
