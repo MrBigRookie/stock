@@ -6,7 +6,7 @@
 
 用法：
   source .venv/bin/activate
-  python stock_monitor.py              # 单次运行（默认）
+  python stock_monitor.py              # 单次运行
   python stock_monitor.py --schedule   # 定时运行（默认交易日下午15:30）
 """
 
@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -43,7 +44,7 @@ CONFIG = {
     "schedule_time": os.getenv("SCHEDULE_TIME", "15:30"),
 }
 
-# 关键词配置：板块 -> 关键词列表
+# 板块 -> 关键词列表
 KEYWORDS = {
     "新能源": [
         "新能源", "光伏", "锂电", "锂电池", "储能", "风电", "氢能", "钠离子",
@@ -64,22 +65,29 @@ KEYWORDS = {
     ],
 }
 
+# 涨停板/龙虎榜行业过滤词
+ZT_FILTER = [
+    "半导体", "芯片", "光刻机", "AI", "人工智能", "算力", "机器人",
+    "光伏", "锂电", "锂电池", "储能", "风电", "氢能", "充电桩", "新能源",
+    "光模块", "CPO", "PCB", "服务器", "数据中心",
+]
+
 NEGATIVE_WORDS = [
     "下跌", "暴跌", "跌停", "亏损", "减持", "暴雷", "退市", "处罚", "违规",
     "诉讼", "债务违约", "业绩下滑", "预亏", "风险提示", "监管", "问询函",
 ]
 POSITIVE_WORDS = [
     "上涨", "涨停", "增长", "突破", "创新高", "增持", "盈利", "超预期",
-    "利好", "中标", "签约", "量产", "交付", "扩产", "投资",
+    "利好", "中标", "签约", "量产", "交付", "扩产", "投资", "战略合作",
 ]
 
 SCRIPT_DIR = Path(__file__).parent
 
 
-# ── 数据采集 ──────────────────────────────────────────
+# ── 工具函数 ──────────────────────────────────────────
 
 def _safe_call(fn, label, retries=2, **kwargs):
-    """安全调用 API，支持重试，失败时返回 None"""
+    """安全调用 API，支持重试"""
     for attempt in range(retries + 1):
         try:
             result = fn(**kwargs)
@@ -94,11 +102,26 @@ def _safe_call(fn, label, retries=2, **kwargs):
             return None
 
 
+def match_keywords(text, keywords):
+    return [kw for kw in keywords if kw in text]
+
+
+def simple_sentiment(text):
+    pos = sum(1 for w in POSITIVE_WORDS if w in text)
+    neg = sum(1 for w in NEGATIVE_WORDS if w in text)
+    if pos > neg:
+        return "positive", pos - neg
+    elif neg > pos:
+        return "negative", neg - pos
+    return "neutral", 0
+
+
+# ── 数据采集 ──────────────────────────────────────────
+
 def fetch_news():
     """采集财联社 + 东方财富新闻"""
     all_news = []
 
-    # 财联社电报 — 列名: 标题, 内容, 发布日期, 发布时间
     df = _safe_call(ak.stock_info_global_cls, "财联社电报")
     if df is not None:
         for _, row in df.iterrows():
@@ -111,7 +134,6 @@ def fetch_news():
                 "source": "财联社",
             })
 
-    # 东方财富快讯 — 列名: 标题, 摘要, 发布时间, 链接
     df = _safe_call(ak.stock_info_global_em, "东方财富快讯")
     if df is not None:
         for _, row in df.iterrows():
@@ -126,7 +148,7 @@ def fetch_news():
 
 
 def fetch_north_flow():
-    """获取北向资金近期流向（优先净买额，回退到持股市值变化估算）"""
+    """北向资金近期流向"""
     result = {"daily": None, "summary": ""}
     df = _safe_call(ak.stock_hsgt_hist_em, "北向资金历史", symbol="北向资金")
     if df is None or df.empty:
@@ -135,113 +157,171 @@ def fetch_north_flow():
     recent = df.tail(10)
     result["daily"] = recent
 
-    # 优先用 当日成交净买额
     net_col = "当日成交净买额"
     if net_col in recent.columns and recent[net_col].notna().any():
         valid = recent[net_col].dropna()
         if len(valid) >= 3:
             total = valid.tail(5).sum()
             direction = "净流入" if total > 0 else "净流出"
-            result["summary"] = f"近5日北向资金{direction}{abs(total / 1e8):.2f}亿元"
+            result["summary"] = f"北向近5日{direction}{abs(total / 1e8):.1f}亿"
             return result
 
-    # 回退：用持股市值变化估算
     hold_col = "持股市值"
     if hold_col in recent.columns and recent[hold_col].notna().any():
         valid = recent[hold_col].dropna()
         if len(valid) >= 2:
             chg = valid.iloc[-1] - valid.iloc[-min(6, len(valid))]
             direction = "增" if chg > 0 else "减"
-            result["summary"] = f"近5日持股市值变动{direction}{abs(chg / 1e8):.0f}亿（估算）"
+            result["summary"] = f"北向持仓估值变动{direction}{abs(chg / 1e8):.0f}亿"
 
     return result
 
 
 def fetch_north_summary():
-    """获取北向/南向资金当日汇总"""
+    """北向资金当日汇总"""
     df = _safe_call(ak.stock_hsgt_fund_flow_summary_em, "北向资金汇总")
     if df is None or df.empty:
         return None, ""
     north_df = df[df["资金方向"] == "北向"] if "资金方向" in df.columns else df
     parts = []
+    total_net = 0
     for _, row in north_df.iterrows():
         board = row.get("板块", "")
         amount = row.get("成交净买额", 0)
         if pd.isna(amount):
             amount = 0
+        total_net += amount
         parts.append(f"{board} {amount/1e8:+.1f}亿")
-    return north_df, " | ".join(parts)
-
-
-def fetch_market_hot():
-    """获取市场热度排名（可能因数据源限流失败）"""
-    df = _safe_call(ak.stock_hot_rank_em, "市场热度排名", retries=3)
-    if df is None or df.empty:
-        return []
-    stocks = []
-    for _, row in df.head(30).iterrows():
-        name = str(row.get("股票名称", ""))
-        code = str(row.get("代码", ""))
-        change = row.get("涨跌幅", 0)
-        change_val = float(change) if pd.notna(change) else 0
-        stocks.append({"code": code, "name": name, "change": change_val})
-    return stocks
+    summary = " | ".join(parts) if parts else ""
+    return north_df, summary
 
 
 def fetch_market_fund_flow():
-    """获取全市场资金流向（大盘资金面参考）"""
+    """全市场资金流向"""
     df = _safe_call(ak.stock_market_fund_flow, "市场资金流向", retries=3)
     if df is None or df.empty:
         return None
     latest = df.iloc[-1]
     net = latest.get("主力净流入-净额", 0)
+    super_large = latest.get("超大单净流入-净额", 0)
+    large = latest.get("大单净流入-净额", 0)
     direction = "流入" if net > 0 else "流出"
     return {
         "date": str(latest.get("日期", "")),
         "net_flow": float(net) if pd.notna(net) else 0,
-        "summary": f"主力资金净{direction}{abs(net / 1e8):.1f}亿",
+        "super_large": float(super_large) if pd.notna(super_large) else 0,
+        "large": float(large) if pd.notna(large) else 0,
+        "summary": f"主力{direction}{abs(net / 1e8):.1f}亿",
     }
 
 
-def fetch_sector_flow():
-    """获取行业板块资金流向（可能因数据源限流失败）"""
-    df = _safe_call(ak.stock_sector_fund_flow_rank, "行业资金流向", retries=3, indicator="今日")
+def fetch_zt_pool(date_str=None):
+    """涨停板数据，过滤新能源/AI相关"""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y%m%d")
+    df = _safe_call(ak.stock_zt_pool_em, "涨停板", retries=3, date=date_str)
+    if df is None or df.empty:
+        return [], None
+
+    # 过滤相关行业
+    relevant = []
+    for _, row in df.iterrows():
+        industry = str(row.get("所属行业", ""))
+        name = str(row.get("名称", ""))
+        code = str(row.get("代码", ""))
+        # 检查行业和名称是否匹配目标关键词
+        text = industry + name
+        matched = False
+        matched_kw = ""
+        for kw in ZT_FILTER:
+            if kw in text:
+                matched = True
+                matched_kw = kw
+                break
+        if matched:
+            relevant.append({
+                "code": code,
+                "name": name,
+                "industry": industry,
+                "change": float(row.get("涨跌幅", 0)) if pd.notna(row.get("涨跌幅")) else 0,
+                "limit_times": int(row.get("连板数", 1)) if pd.notna(row.get("连板数", "")) else 1,
+                "amount": float(row.get("成交额", 0)) if pd.notna(row.get("成交额")) else 0,
+                "keyword": matched_kw,
+            })
+
+    stats = {
+        "total": len(df),
+        "relevant": len(relevant),
+        "max_lianban": max((r["limit_times"] for r in relevant), default=0),
+    }
+    return relevant, stats
+
+
+def fetch_lhb(date_str=None):
+    """龙虎榜数据，筛选机构买入且与新能源/AI相关"""
+    if date_str is None:
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d")
+    else:
+        end_date = date_str
+        start_date = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d")
+
+    df = _safe_call(ak.stock_lhb_detail_em, "龙虎榜", retries=3, start_date=start_date, end_date=end_date)
     if df is None or df.empty:
         return []
-    sectors = []
-    name_col = "名称" if "名称" in df.columns else df.columns[0]
-    flow_col = (
-        "主力净流入-净额" if "主力净流入-净额" in df.columns
-        else "今日主力净流入-净额" if "今日主力净流入-净额" in df.columns
-        else df.columns[1]
-    )
-    for _, row in df.head(20).iterrows():
-        name = str(row.get(name_col, ""))
-        flow = float(row.get(flow_col, 0)) if pd.notna(row.get(flow_col, "")) else 0
-        sectors.append({"name": name, "net_flow": flow})
-    return sectors
+
+    # 筛选：机构买入 + 相关行业
+    relevant = []
+    for _, row in df.iterrows():
+        reason = str(row.get("上榜原因", ""))
+        jg_str = str(row.get("解读", ""))
+        name = str(row.get("名称", ""))
+        code = str(row.get("代码", ""))
+        net_buy = row.get("龙虎榜净买额", 0)
+        if pd.isna(net_buy):
+            net_buy = 0
+        net_buy = float(net_buy)
+
+        # 过滤条件：机构参与 或 净买入 > 1000万
+        has_jigou = "机构" in jg_str
+        if not has_jigou and net_buy < 10_000_000:
+            continue
+
+        relevant.append({
+            "code": code,
+            "name": name,
+            "reason": reason,
+            "jiedu": jg_str,
+            "net_buy": net_buy,
+            "change": float(row.get("涨跌幅", 0)) if pd.notna(row.get("涨跌幅")) else 0,
+            "date": str(row.get("上榜日", "")),
+        })
+
+    # 按净买入排序
+    relevant.sort(key=lambda x: x["net_buy"], reverse=True)
+    return relevant[:20]
+
+
+def fetch_stock_fund_flow(code, name):
+    """获取个股近5日资金流向"""
+    market = "sh" if code.startswith("6") else "sz"
+    symbol = code.replace("SH", "").replace("SZ", "").replace("sh", "").replace("sz", "")
+    df = _safe_call(ak.stock_individual_fund_flow, f"个股资金-{name}", stock=symbol, market=market)
+    if df is None or df.empty:
+        return None
+    recent = df.tail(5)
+    net = recent["主力净流入-净额"].sum() if "主力净流入-净额" in recent.columns else 0
+    main_pct = recent["主力净流入-净占比"].mean() if "主力净流入-净占比" in recent.columns else 0
+    return {
+        "net_5d": float(net) if pd.notna(net) else 0,
+        "main_pct": float(main_pct) if pd.notna(main_pct) else 0,
+    }
 
 
 # ── 分析引擎 ──────────────────────────────────────────
 
-def match_keywords(text, keywords):
-    """匹配文本中的关键词并返回匹配列表"""
-    return [kw for kw in keywords if kw in text]
-
-
-def simple_sentiment(text):
-    """简单的情感分析：正负词计数"""
-    pos = sum(1 for w in POSITIVE_WORDS if w in text)
-    neg = sum(1 for w in NEGATIVE_WORDS if w in text)
-    if pos > neg:
-        return "positive", pos - neg
-    elif neg > pos:
-        return "negative", neg - pos
-    return "neutral", 0
-
-
 def extract_companies(text):
-    """从文本中提取命中的公司/行业关键词（>=3字，排除资金面通用词）"""
+    """提取命中的公司/行业关键词（>=3字，排除资金面通用词）"""
     companies = set()
     for sector, kws in KEYWORDS.items():
         if sector == "资金面":
@@ -252,8 +332,8 @@ def extract_companies(text):
     return companies
 
 
-def analyze(news_list, hot_stocks):
-    """核心分析：关键词热度 + 情感 + 市场热度交叉"""
+def analyze_news(news_list):
+    """新闻关键词分析"""
     company_mentions = Counter()
     company_sentiment = defaultdict(int)
     keyword_hits = Counter()
@@ -283,24 +363,14 @@ def analyze(news_list, hot_stocks):
             if len(company_titles[c]) < 5:
                 company_titles[c].append(news["title"])
 
-    # 市场热度股票
-    hot_names = {s["name"] for s in hot_stocks}
-    hot_change = {s["name"]: s["change"] for s in hot_stocks}
-
     scored = []
     for name, count in company_mentions.items():
         sent = company_sentiment[name]
-        in_hot = name in hot_names
-        hot_bonus = 1.5 if in_hot else 1.0
-        chg = hot_change.get(name, 0)
-        raw_score = count * (1 + 0.3 * sent) * hot_bonus
-
+        raw_score = count * (1 + 0.3 * sent)
         scored.append({
             "name": name,
             "mentions": count,
             "sentiment": round(sent, 1),
-            "in_hot_rank": in_hot,
-            "hot_change": round(chg, 2),
             "score": round(max(raw_score, 0), 2),
             "recent_titles": company_titles[name],
         })
@@ -311,61 +381,74 @@ def analyze(news_list, hot_stocks):
 
 # ── 输出 ──────────────────────────────────────────────
 
-def print_report(scored, keyword_hits, north_summary, north_detail, market_flow, sector_flow, top_n):
-    """终端报告输出"""
+def print_report(scored, keyword_hits, north_summary, north_detail, market_flow,
+                 zt_relevant, zt_stats, lhb_relevant, top_n):
+    """终端报告"""
     print("\n" + "=" * 80)
     print(f"  财经资讯分析报告  |  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 80)
 
     # 资金面概览
-    if north_summary:
-        print(f"\n  [北向资金] {north_summary}")
+    print(f"\n  ━━ 资金面 ━━")
+    print(f"  [北向] {north_summary}")
     if north_detail:
-        print(f"  [当日汇总] {north_detail}")
+        print(f"         当日 {north_detail}")
     if market_flow:
-        print(f"  [主力资金] {market_flow['summary']}")
+        s = market_flow["summary"]
+        extra = ""
+        if market_flow.get("super_large"):
+            extra = f" (超大单{market_flow['super_large']/1e8:+.1f}亿)"
+        print(f"  [主力] {s}{extra}")
 
+    # 涨停板
+    if zt_stats and zt_stats["total"] > 0:
+        print(f"\n  ━━ 今日涨停 ━━")
+        print(f"  全市场 {zt_stats['total']} 家涨停，新能源/AI相关 {zt_stats['relevant']} 家"
+              f"，最高 {zt_stats['max_lianban']} 连板")
+        if zt_relevant:
+            print(f"  {'名称':<10} {'行业':<12} {'涨幅':<8} {'连板':<4} {'关键词'}")
+            print(f"  {'-' * 50}")
+            for item in zt_relevant[:10]:
+                print(f"  {item['name']:<10} {item['industry']:<12} {item['change']:>6.1f}%  "
+                      f"{item['limit_times']:>3}板  {item['keyword']}")
+
+    # 龙虎榜
+    if lhb_relevant:
+        print(f"\n  ━━ 龙虎榜关注（近3日机构参与）━━")
+        for i, item in enumerate(lhb_relevant[:8], 1):
+            net_str = f"{item['net_buy']/1e8:+.2f}亿" if abs(item['net_buy']) >= 1e8 else f"{item['net_buy']/1e4:+.0f}万"
+            print(f"  {i}. {item['name']:<8} {net_str:<12} {item['jiedu'][:40]}")
+
+    # 新闻分析排名
     if not scored:
         print("\n  暂无符合新能源/AI关键词的新闻数据")
         return ""
 
-    # 表格
-    hdr = f"  {'排名':<4} {'公司/关键词':<16} {'热度':<6} {'情感':<6} {'涨跌%':<8} {'综合分':<8} {'热度榜'}"
-    print(f"\n{hdr}")
-    print("  " + "-" * 74)
+    print(f"\n  ━━ 资讯热度排行 ━━")
+    hdr = f"  {'排名':<4} {'公司/关键词':<16} {'热度':<6} {'情感':<6} {'综合分':<8}"
+    print(hdr)
+    print("  " + "-" * 50)
 
     report_lines = []
     for i, item in enumerate(scored[:top_n], 1):
-        hot_flag = "TOP" if item["in_hot_rank"] else "-"
-        line = (
-            f"  {i:<4} {item['name']:<16} {item['mentions']:<6} "
-            f"{item['sentiment']:<6} {item['hot_change']:<8} {item['score']:<8} {hot_flag}"
-        )
+        sent_label = "正面" if item["sentiment"] > 0 else ("负面" if item["sentiment"] < 0 else "中性")
+        line = (f"  {i:<4} {item['name']:<16} {item['mentions']:<6} "
+                f"{sent_label:<6} {item['score']:<8}")
         print(line)
         report_lines.append(
-            f"{i}. {item['name']} | 热度:{item['mentions']} | "
-            f"情感:{item['sentiment']} | 涨跌:{item['hot_change']}% | 评分:{item['score']}"
-        )
+            f"{i}. {item['name']} | 热度:{item['mentions']} | 情感:{sent_label} | 评分:{item['score']}")
 
-    print("  " + "-" * 74)
+    print("  " + "-" * 50)
     print(f"\n  共分析 {len(scored)} 个关键词相关实体\n")
 
     # 关键词热度
     if keyword_hits:
-        print("  关键词热度 TOP10:")
+        print("  ━━ 关键词热度 TOP10 ━━")
         for kw, cnt in keyword_hits.most_common(10):
             print(f"    {kw}: {cnt}次")
         print()
 
-    # 行业资金流向
-    if sector_flow:
-        print("  行业资金流入 TOP5:")
-        for s in sector_flow[:5]:
-            direction = "流入" if s["net_flow"] > 0 else "流出"
-            print(f"    {s['name']}: {direction}{abs(s['net_flow'] / 1e8):.2f}亿")
-        print()
-
-    # 重点公司新闻
+    # 重点新闻
     for item in scored[:5]:
         if item["recent_titles"]:
             print(f"  [{item['name']}] 相关新闻:")
@@ -376,19 +459,16 @@ def print_report(scored, keyword_hits, north_summary, north_detail, market_flow,
     return "\n".join(report_lines)
 
 
-def export_csv(scored, keyword_hits):
+def export_csv(scored, zt_relevant, lhb_relevant, keyword_hits):
     """导出 CSV"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     path = SCRIPT_DIR / f"report_{timestamp}.csv"
     rows = []
-    for item in scored:
+    for i, item in enumerate(scored, 1):
         rows.append({
-            "排名": 0, "名称": item["name"], "热度": item["mentions"],
-            "情感分": item["sentiment"], "涨跌幅": item["hot_change"],
-            "综合评分": item["score"], "市场热度TOP30": "Y" if item["in_hot_rank"] else "N",
+            "排名": i, "名称": item["name"], "热度": item["mentions"],
+            "情感分": item["sentiment"], "综合评分": item["score"],
         })
-    for i, r in enumerate(rows, 1):
-        r["排名"] = i
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
     print(f"  报告已导出: {path}")
     return path
@@ -397,46 +477,68 @@ def export_csv(scored, keyword_hits):
 # ── 推送 ──────────────────────────────────────────────
 
 def push_bark(title, body):
-    """通过 Bark 推送到 iOS 设备"""
+    """Bark 推送"""
     key = CONFIG["bark_key"]
     if not key:
         print("  [INFO] 未配置 BARK_KEY，跳过推送")
         return False
-
-    from urllib.parse import quote
     url = f"{CONFIG['bark_url']}/{key}/{quote(title)}/{quote(body)}"
     try:
         resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get("code") == 200:
+        if resp.json().get("code") == 200:
             print(f"  推送成功: {title}")
             return True
-        print(f"  [WARN] 推送失败: {data}")
+        print(f"  [WARN] 推送失败: {resp.json()}")
         return False
     except Exception as e:
         print(f"  [WARN] 推送异常: {e}")
         return False
 
 
-def build_push_message(scored, north_summary, north_detail, keyword_hits, top_n=8):
-    """构建推送文本"""
-    if not scored:
-        return "今日无符合条件的潜力股"
+def build_push_message(scored, north_summary, north_detail, market_flow,
+                       zt_relevant, zt_stats, lhb_relevant, keyword_hits):
+    """构建结构化推送"""
+    now = datetime.now().strftime("%m-%d %H:%M")
+    lines = [f"【财经日报 {now}】", ""]
 
-    lines = [
-        f"【{datetime.now().strftime('%m-%d %H:%M')}】",
-        north_summary,
-        north_detail,
-        "",
-        "潜力关注:",
-    ]
-    for i, item in enumerate(scored[:top_n], 1):
-        hot = " TOP" if item["in_hot_rank"] else ""
-        lines.append(f"{i}.{item['name']}({item['score']}){hot}")
+    # 资金面
+    lines.append("━━ 资金面 ━━")
+    lines.append(north_summary)
+    if market_flow:
+        lines.append(market_flow["summary"])
+    lines.append("")
 
+    # 涨停
+    if zt_stats and zt_stats["total"] > 0:
+        rel = zt_stats["relevant"]
+        lines.append(f"━━ 涨停({zt_stats['total']}家) ━━")
+        lines.append(f"新能源/AI相关: {rel}家")
+        if zt_relevant:
+            for item in zt_relevant[:6]:
+                lb = f"{item['limit_times']}连板" if item["limit_times"] > 1 else ""
+                lines.append(f"  {item['name']} {lb} [{item['keyword']}]")
+        lines.append("")
+
+    # 龙虎榜
+    if lhb_relevant:
+        lines.append("━━ 龙虎榜 ━━")
+        for item in lhb_relevant[:5]:
+            net_str = f"{item['net_buy']/1e8:+.2f}亿" if abs(item['net_buy']) >= 1e8 else f"{item['net_buy']/1e4:+.0f}万"
+            lines.append(f"  {item['name']} {net_str} {item['jiedu'][:30]}")
+        lines.append("")
+
+    # 热度排行
+    if scored:
+        lines.append("━━ 热度排行 ━━")
+        for i, item in enumerate(scored[:8], 1):
+            sent = "↑" if item["sentiment"] > 0 else ("↓" if item["sentiment"] < 0 else "→")
+            lines.append(f"{i}.{item['name']} {sent}({item['score']})")
+        lines.append("")
+
+    # 热门词
     if keyword_hits:
-        top_kw = [kw for kw, _ in keyword_hits.most_common(5)]
-        lines.append("\n热门词: " + "、".join(top_kw))
+        top_kw = [f"{kw}({cnt})" for kw, cnt in keyword_hits.most_common(6)]
+        lines.append("🏷️ " + " ".join(top_kw))
 
     body = "\n".join(lines)
     return body[:480] + "..." if len(body) > 500 else body
@@ -447,15 +549,16 @@ def build_push_message(scored, north_summary, north_detail, keyword_hits, top_n=
 def run_analysis():
     """执行一次完整分析"""
     t0 = time.time()
+    today = datetime.now().strftime("%Y%m%d")
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 开始采集数据...")
 
     # 1. 新闻
     print("  -> 采集财经新闻...")
     all_news = fetch_news()
-    print(f"     共获取 {len(all_news)} 条新闻")
+    print(f"     共 {len(all_news)} 条")
 
     # 2. 北向资金
-    print("  -> 获取北向资金数据...")
+    print("  -> 获取北向资金...")
     north_flow = fetch_north_flow()
     north_df, north_detail = fetch_north_summary()
     print(f"     {north_flow['summary']}")
@@ -466,36 +569,38 @@ def run_analysis():
     if market_flow:
         print(f"     {market_flow['summary']}")
 
-    # 4. 市场热度排名（可选，可能因限流失败）
-    print("  -> 获取市场热度排名...")
-    hot_stocks = fetch_market_hot()
-    if hot_stocks:
-        print(f"     获取 Top{len(hot_stocks)} 热度股")
+    # 4. 涨停板
+    print("  -> 获取涨停板数据...")
+    zt_relevant, zt_stats = fetch_zt_pool(today)
+    if zt_stats:
+        print(f"     全市场 {zt_stats['total']} 家涨停，相关 {zt_stats['relevant']} 家")
     else:
-        print(f"     (跳过：数据源暂时不可用)")
+        print(f"     (今日无涨停数据或非交易日)")
 
-    # 5. 行业资金流向（可选）
-    print("  -> 获取行业资金流向...")
-    sector_flow = fetch_sector_flow()
-    if sector_flow:
-        print(f"     获取 {len(sector_flow)} 个行业数据")
+    # 5. 龙虎榜
+    print("  -> 获取龙虎榜数据...")
+    lhb_relevant = fetch_lhb(today)
+    if lhb_relevant:
+        print(f"     机构参与 {len(lhb_relevant)} 条记录")
     else:
-        print(f"     (跳过：数据源暂时不可用)")
+        print(f"     (无相关记录)")
 
-    # 6. 分析
-    print("  -> 分析中...")
-    scored, keyword_hits = analyze(all_news, hot_stocks)
+    # 6. 新闻分析
+    print("  -> 分析新闻...")
+    scored, keyword_hits = analyze_news(all_news)
 
     # 7. 输出
-    report = print_report(scored, keyword_hits, north_flow["summary"], north_detail, market_flow, sector_flow, CONFIG["top_n"])
+    print_report(scored, keyword_hits, north_flow["summary"], north_detail, market_flow,
+                 zt_relevant, zt_stats, lhb_relevant, CONFIG["top_n"])
 
-    # 8. 导出 CSV
-    export_csv(scored, keyword_hits)
+    # 8. 导出
+    export_csv(scored, zt_relevant, lhb_relevant, keyword_hits)
 
     # 9. 推送
     if CONFIG["bark_key"]:
-        title = "财经分析日报"
-        body = build_push_message(scored, north_flow["summary"], north_detail, keyword_hits)
+        title = f"财经日报 {datetime.now().strftime('%m-%d')}"
+        body = build_push_message(scored, north_flow["summary"], north_detail, market_flow,
+                                  zt_relevant, zt_stats, lhb_relevant, keyword_hits)
         push_bark(title, body)
 
     elapsed = time.time() - t0
@@ -505,7 +610,7 @@ def run_analysis():
 
 
 def run_schedule():
-    """定时调度模式"""
+    """定时调度"""
     schedule_time = CONFIG["schedule_time"]
     hour, minute = map(int, schedule_time.split(":"))
 
@@ -530,12 +635,10 @@ def run_schedule():
             time.sleep(60)
 
 
-# ── 入口 ──────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="财经资讯分析 & 潜力股挖掘")
     parser.add_argument("--schedule", action="store_true", help="定时模式，每日收盘后执行")
-    parser.add_argument("--top", type=int, default=CONFIG["top_n"], help=f"展示 Top N")
+    parser.add_argument("--top", type=int, default=CONFIG["top_n"], help="展示 Top N")
     parser.add_argument("--no-push", action="store_true", help="禁用 Bark 推送")
     args = parser.parse_args()
 
